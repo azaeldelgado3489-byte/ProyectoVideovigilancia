@@ -1,0 +1,350 @@
+eventos.py////////////
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import subprocess
+
+router = APIRouter()
+
+ROSTROS_DIR = "/var/cctv/rostros"
+CLIPS_DIR = "/var/cctv/clips"
+
+os.makedirs(ROSTROS_DIR, exist_ok=True)
+os.makedirs(CLIPS_DIR, exist_ok=True)
+
+TOKEN_VALIDO = "clavesecreta123"
+
+DB_CFG = dict(host="localhost", dbname="cctv_db", user="cctv_user", password="admin")
+
+def db():
+    return psycopg2.connect(cursor_factory=RealDictCursor, **DB_CFG)
+
+@router.post("/api/eventos")
+async def crear_evento(
+    nombre: str = Form(...),
+    confianza: float = Form(...),
+    tipo: str = Form(...),
+    fecha: str = Form(...),
+    token: str = Form(...),
+    imagen: UploadFile = File(...),
+    video: UploadFile = File(...)
+):
+    if token != TOKEN_VALIDO:
+        raise HTTPException(status_code=401, detail="token inválido")
+
+    if imagen is None or not imagen.filename:
+        raise HTTPException(status_code=400, detail="no se recibió archivo de imagen")
+
+    if video is None or not video.filename:
+        raise HTTPException(status_code=400, detail="no se recibió archivo de video")
+
+    # Guardar imagen
+    img_path = os.path.join(ROSTROS_DIR, imagen.filename)
+    with open(img_path, "wb") as f:
+        f.write(await imagen.read())
+
+    # Guardar archivo temporal
+    temp_path = os.path.join(CLIPS_DIR, "temp_" + video.filename)
+    with open(temp_path, "wb") as f:
+        f.write(await video.read())
+
+    # Ruta final
+    vid_path = os.path.join(CLIPS_DIR, video.filename)
+
+    # Si es video, convertir a H.264/AAC
+    if video.content_type and video.content_type.startswith("video/"):
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", temp_path,
+                "-c:v", "libx264", "-c:a", "aac",
+                vid_path
+            ], check=True)
+            os.remove(temp_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"fallo al convertir video: {e}")
+    else:
+        # Si no es video, guardar tal cual
+        os.rename(temp_path, vid_path)
+
+    # Insertar en la base de datos
+    try:
+        ruta_video = video.filename if video and video.filename else ""
+        conn = db(); cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO eventos (
+                persona_id,
+                nombre_detectado,
+                confianza,
+                tipo,
+                fecha,
+                ruta_imagen,
+                ruta_video
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+        """, (
+            None,
+            nombre,
+            confianza,
+            tipo,
+            fecha,
+            imagen.filename,
+            ruta_video
+        ))
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"fallo al insertar en BD: {e}")
+
+    return {
+        "status": "ok",
+        "nombre": nombre,
+        "confianza": confianza,
+        "tipo": tipo,
+        "fecha": fecha,
+        "imagen": imagen.filename,
+        "video": ruta_video
+    }
+
+reportes.py//////////////
+from jinja2 import Environment, FileSystemLoader
+from psycopg2.extras import RealDictCursor
+import psycopg2
+from collections import Counter
+from .correo import enviar_correo
+import os
+
+# Configuración de la BD
+DB_CFG = dict(host="localhost", dbname="cctv_db", user="cctv_user", password="admin")
+
+# Ruta absoluta a la carpeta de plantillas
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_DIR = os.path.join(BASE_DIR, '..', 'templates')
+env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
+
+def obtener_eventos_por_dia(dia: str):
+    """Consulta los eventos de la BD para un día específico."""
+    conn = psycopg2.connect(cursor_factory=RealDictCursor, **DB_CFG)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM eventos
+        WHERE to_char(fecha,'YYYY-MM-DD')=%s
+        ORDER BY fecha DESC;
+    """, (dia,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+def generar_reporte(dia: str, destinatario: str):
+    """Genera un reporte HTML con los eventos del día y lo envía por correo."""
+    eventos = obtener_eventos_por_dia(dia)
+
+    # Calcular total y hora más concurrida
+    total_eventos = len(eventos)
+    horas = [e["fecha"].strftime("%H:%M") for e in eventos] if eventos else []
+    hora_peak = Counter(horas).most_common(1)[0][0] if horas else "N/A"
+
+    # Renderizar plantilla
+    template = env.get_template("reporte.html")
+    html_body = template.render(
+        dia=dia,
+        eventos=eventos,
+        total_eventos=total_eventos,
+        hora_peak=hora_peak
+    )
+
+    # Enviar correo
+    enviar_correo(destinatario, f"Reporte de accesos {dia}", html_body)
+
+//////////////////galleria.html
+{% extends "base.html" %}
+
+{% block title %}Galería {{ dia }}{% endblock %}
+
+{% block content %}
+  <h2>Rostros del día {{ dia }}</h2>
+  <p class="subtitle"></p>
+
+  <div class="info-bar">
+    <div class="info-fechas-bubble">
+      📅 Fechas disponibles: {{ dias|length }}
+    </div>
+    <div class="alert-report">
+      📩 El reporte diario se enviará automáticamente a tu correo a las <strong>12:00 AM</strong>.
+    </div>
+  </div>
+
+  <div class="dias-nav">
+    <label for="dia-select">Ver día:</label>
+    {% if dias and dias|length > 0 %}
+      <select id="dia-select" onchange="location.href='/galeria/' + this.value">
+        {% for d in dias %}
+          <option value="{{ d }}" {% if d == dia %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+
+      {% if dia != hoy %}
+        <a class="btn" href="/galeria/{{ hoy }}">Regresar al día actual</a>
+      {% endif %}
+    {% else %}
+      <span style="color:white">No hay otras fechas registradas.</span>
+    {% endif %}
+  </div>
+
+  <div class="grid">
+    {% for e in eventos %}
+      <figure class="item">
+        <img src="{% if e.ruta_imagen.startswith('rostro_') %}/rostros/{{ e.ruta_imagen }}{% else %}/rostros/{{ dia }}/{{ e.ruta_imagen }}{% endif %}"
+             alt="rostro {{ loop.index }}"
+             loading="lazy"
+             {% if e.ruta_video and e.ruta_video != "" %}
+               onclick="window.open('/clips/{{ e.ruta_video }}', '_blank')"
+             {% endif %}>
+        <figcaption>
+          <span class="badge {% if e.sospechoso %}badge-danger{% endif %}">
+            {{ e.nombre_detectado }}
+          </span>
+          <span class="meta">{{ e.fecha }}</span>
+          {% if e.ruta_video and e.ruta_video != "" %}
+            <span class="meta">🎥 Clip disponible</span>
+          {% else %}
+            <span class="meta">📷 Imagen estática</span>
+          {% endif %}
+        </figcaption>
+      </figure>
+    {% else %}
+      <div class="empty-state">
+        <div class="empty-icon">👤</div>
+        <p>No se detectaron rostros este día</p>
+        {% if dias and dias|length > 0 %}
+          <a class="btn" href="/galeria/{{ dias[0] }}">Ir al último día con eventos</a>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% endblock %}
+
+main.py////////////////////////////////
+azael@prueba:~/app$ sudo cat main.py
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import os, shutil, datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+import reprfast        # 👈 corregido
+import eventos         # 👈 corregido
+
+DB_CFG = dict(host="localhost", dbname="cctv_db", user="cctv_user", password="admin")
+
+app = FastAPI()
+
+# Montar carpetas estáticas
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/rostros", StaticFiles(directory="/var/cctv/rostros"), name="rostros")
+app.mount("/clips", StaticFiles(directory="/var/cctv/clips"), name="clips")
+
+templates = Jinja2Templates(directory="templates")
+
+def db():
+    return psycopg2.connect(cursor_factory=RealDictCursor, **DB_CFG)
+
+# ---------------------------
+# Login / Logout
+# ---------------------------
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request, "user_is_authenticated": False})
+
+@app.post("/login")
+def login_action(username: str = Form(...), password: str = Form(...), request: Request = None):
+    if username == "administrador" and password == "admin123":
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="auth",
+            value="1",
+            path="/",
+            httponly=True,
+            max_age=3600,  # expira en 1 hora
+        )
+        return response
+    return RedirectResponse(url="/login?error=1", status_code=302)
+
+@app.get("/logout")
+def logout():
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie("auth", path="/")
+    return response
+
+# ---------------------------
+# Vistas web
+# ---------------------------
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    auth = request.cookies.get("auth") == "1"
+    if not auth:
+        return RedirectResponse(url="/login", status_code=302)
+
+    hoy = datetime.date.today().strftime("%Y-%m-%d")
+    return RedirectResponse(url=f"/galeria/{hoy}", status_code=302)
+
+@app.get("/galeria/{dia}", response_class=HTMLResponse)
+def galeria(request: Request, dia: str):
+    conn = db(); cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT to_char(fecha,'YYYY-MM-DD') AS dia
+        FROM eventos
+        ORDER BY dia DESC;
+    """)
+    rows = cur.fetchall()
+    dias = [r["dia"] for r in rows] if rows else []
+
+    cur.execute("""
+        SELECT *
+        FROM eventos
+        WHERE to_char(fecha,'YYYY-MM-DD')=%s
+        ORDER BY fecha DESC;
+    """, (dia,))
+    eventos_rows = cur.fetchall()
+
+    cur.close(); conn.close()
+    hoy = datetime.date.today().strftime("%Y-%m-%d")
+
+    auth = request.cookies.get("auth") == "1"
+
+    return templates.TemplateResponse(
+        "galeria.html",
+        {
+            "request": request,
+            "dia": dia,
+            "eventos": eventos_rows,
+            "dias": dias,
+            "hoy": hoy,
+            "user_is_authenticated": auth
+        }
+    )
+
+# ---------------------------
+# Routers
+# ---------------------------
+app.include_router(reprfast.router)
+app.include_router(eventos.router)
+
+# ---------------------------
+# Scheduler para reportes diarios
+# ---------------------------
+from apscheduler.schedulers.background import BackgroundScheduler
+from services.reportes import generar_reporte   # 👈 corregido
+
+scheduler = BackgroundScheduler()
+
+def tarea_reporte_diario():
+    hoy = datetime.date.today().strftime("%Y-%m-%d")
+    generar_reporte(hoy, "proyectovps7@gmail.com")
+
+scheduler.add_job(tarea_reporte_diario, 'cron', hour=0, minute=0)
+scheduler.start()

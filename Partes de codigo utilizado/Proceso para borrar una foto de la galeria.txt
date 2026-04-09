@@ -1,0 +1,79 @@
+Proceso para borrar una foto de la galeria
+///////////////////////////////////////////////////////////
+azael@prueba:~$ psql -h localhost -U cctv_user -d cctv_db
+Password for user cctv_user:
+psql (16.10 (Ubuntu 16.10-0ubuntu0.24.04.1))
+SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)
+Type "help" for help.
+
+cctv_db=> SELECT id, fecha, nombre_detectado, confianza, sospechoso, ruta_imagen
+FROM eventos
+WHERE fecha = '2025-10-29 14:03:08.299145';
+ id |           fecha            | nombre_detectado | confianza | sospechoso |      ruta_imagen
+----+----------------------------+------------------+-----------+------------+------------------------
+ 11 | 2025-10-29 14:03:08.299145 | desconocido      |         0 | t          | 140308_desconocido.jpg
+(1 row)
+
+cctv_db=> DELETE FROM eventos WHERE id = 11;
+DELETE 1
+cctv_db=> \q
+azael@prueba:~$ rm /var/cctv/rostros/2025-10-29/140308_desconocido.jpg
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+Restart para cuando se realizan cambios
+
+sudo systemctl restart fastapi
+sudo systemctl restart nginx
+sudo systemctl daemon-reload
+sudo systemctl restart postgresql
+sudo certbot --nginx -d galleryip.duckdns.org
+
+Sudo mkdir para crear una carpeta
+Sudo chown para dar permisos
+Cd para navegar entre carpetas
+Ls para mostrar lo que hay en un directorio
+
+vpiy ymrl rrcp juah app password?
+
+si reiniciar la maquina virtual vuelve a instalar el uvicorn en el venv
+
+//forzar el reporte
+cd ~/app
+source venv/bin/activate
+PYTHONPATH=. python
+from services.reportes import generar_reporte
+generar_reporte("2025-11-09", "proyectovps7@gmail.com")
+
+/////////////////////////////////////////////////
+ver la tabla de la bd 
+cctv_db=> select * from eventos
+cctv_db-> select eventos
+cctv_db-> \d eventos
+                                           Table "public.eventos"
+      Column      |            Type             | Collation | Nullable |               Default
+------------------+-----------------------------+-----------+----------+-------------------------------------
+ id               | integer                     |           | not null | nextval('eventos_id_seq'::regclass)
+ persona_id       | integer                     |           |          |
+ nombre_detectado | text                        |           |          |
+ confianza        | real                        |           |          |
+ tipo             | text                        |           |          |
+ fecha            | timestamp without time zone |           |          |
+ ruta_imagen      | text                        |           |          |
+ ruta_video       | text                        |           |          |
+Indexes:
+    "eventos_pkey" PRIMARY KEY, btree (id)
+Foreign-key constraints:
+    "eventos_persona_id_fkey" FOREIGN KEY (persona_id) REFERENCES personas(id)
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+Puedes correr un comando en el VPS para convertir todos los .mp4 que ya existen en /var/cctv/clips:
+
+bash
+cd /var/cctv/clips
+
+for f in *.mp4; do
+  ffmpeg -y -i "$f" -c:v libx264 -c:a aac "converted_$f"
+  mv "converted_$f" "$f"
+done
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////

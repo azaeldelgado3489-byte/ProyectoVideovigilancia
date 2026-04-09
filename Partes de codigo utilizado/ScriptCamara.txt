@@ -1,0 +1,208 @@
+import cv2
+import face_recognition
+import time
+import datetime
+import logging
+import requests
+import os
+import numpy as np
+import threading
+import queue
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+RTSP = "rtsp://cisco123:admin123@192.168.1.143:554/stream1"
+API = "https://galleryip.duckdns.org/api/eventos"
+TOKEN = "clavesecreta123"
+
+MODEL = "hog"
+FRAME_INTERVAL = 20
+CLIP_FRAMES = 20
+WATCHDOG_MAX_FAILS = 10
+
+# Cola global
+send_queue = queue.Queue()
+
+logging.info(f"Motor de detección: {MODEL}")
+
+
+def conectar_camara():
+    logging.info("Intentando conectar a la cámara RTSP con FFMPEG...")
+    cap = cv2.VideoCapture(RTSP, cv2.CAP_FFMPEG)
+
+    if not cap.isOpened():
+        logging.warning("FFMPEG no abrió el stream, probando backend por defecto...")
+        cap = cv2.VideoCapture(RTSP)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+    for _ in range(20):
+        if cap.isOpened():
+            logging.info("Cámara conectada correctamente.")
+            return cap
+        time.sleep(0.5)
+
+    logging.error("NO se pudo conectar a la cámara.")
+    return None
+
+
+def detectar_rostros_y_cajas(frame):
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        boxes = face_recognition.face_locations(rgb, model=MODEL)
+        rostros_grandes = []
+        rostros_pequenos = []
+
+        frame_width = frame.shape[1]
+
+        for (top, right, bottom, left) in boxes:
+            margen = 20
+            top = max(0, top - margen)
+            left = max(0, left - margen)
+            bottom = min(frame.shape[0], bottom + margen)
+            right = min(frame.shape[1], right + margen)
+
+            rostro = frame[top:bottom, left:right]
+
+            if rostro.size > 0:
+                alto, ancho = rostro.shape[:2]
+                proporción = ancho / frame_width
+
+                if proporción > 0.05:  # rostro ocupa más del 5% del ancho → recorte
+                    factor = 2.0 if ancho < 180 else 1.0
+                    nuevo_ancho = int(ancho * factor)
+                    nuevo_alto = int(alto * factor)
+                    rostro = cv2.resize(
+                        rostro,
+                        (nuevo_ancho, nuevo_alto),
+                        interpolation=cv2.INTER_LANCZOS4
+                    )
+                    rostro = cv2.bilateralFilter(rostro, d=5, sigmaColor=75, sigmaSpace=75)
+                    rostros_grandes.append(rostro)
+                else:
+                    # rostro pequeño → frame completo con caja
+                    frame_con_caja = frame.copy()
+                    cv2.rectangle(frame_con_caja, (left, top), (right, bottom), (0, 255, 0), 2)
+                    rostros_pequenos.append(frame_con_caja)
+
+        return rostros_grandes, rostros_pequenos, boxes
+
+    except Exception as e:
+        logging.error(f"Error detectando rostros: {e}")
+        return [], [], []
+
+
+def enviar_api(nombre, confianza, rostro, fullframe, clip_path, timestamp):
+    try:
+        rostro_name = f"rostro_{timestamp}.jpg"
+        frame_name = f"frame_{timestamp}.jpg"
+
+        cv2.imwrite(rostro_name, rostro, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        full_resized = cv2.resize(fullframe, (1280, 720))
+        cv2.imwrite(frame_name, full_resized, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+        with open(rostro_name, "rb") as f1, open(frame_name, "rb") as f2, open(clip_path, "rb") as f3:
+            files = {
+                "imagen": (rostro_name, f1, "image/jpeg"),
+                "frame_completo": (frame_name, f2, "image/jpeg"),
+                "video": (clip_path, f3, "video/mp4")
+            }
+            data = {
+                "nombre": nombre,
+                "confianza": confianza,
+                "tipo": "entrada",
+                "fecha": timestamp,
+                "token": TOKEN
+            }
+
+            r = requests.post(API, files=files, data=data, timeout=20)
+            logging.info(f"API respondió: {r.status_code}")
+
+    except Exception as e:
+        logging.error(f"Error enviando API: {e}")
+
+    finally:
+        for f in [rostro_name, frame_name, clip_path]:
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def worker():
+    """Hilo que procesa la cola de envíos"""
+    while True:
+        task = send_queue.get()
+        if task is None:
+            break
+        enviar_api(*task)
+        send_queue.task_done()
+
+
+# Lanzar hilo worker
+threading.Thread(target=worker, daemon=True).start()
+
+cap = conectar_camara()
+if cap is None:
+    exit()
+
+frame_count = 0
+fails = 0
+
+while True:
+    ret, frame = cap.read()
+
+    if not ret:
+        fails += 1
+        logging.warning(f"Frame inválido. Fallas: {fails}/{WATCHDOG_MAX_FAILS}")
+        if fails >= WATCHDOG_MAX_FAILS:
+            logging.error("Reiniciando RTSP...")
+            cap.release()
+            time.sleep(2)
+            cap = conectar_camara()
+            fails = 0
+        continue
+
+    fails = 0
+    frame_count += 1
+
+    if frame_count % FRAME_INTERVAL != 0:
+        continue
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    rostros_grandes, rostros_pequenos, boxes = detectar_rostros_y_cajas(frame)
+
+    if not rostros_grandes and not rostros_pequenos:
+        logging.info("Sin rostros detectados.")
+        continue
+
+    logging.info(f"{len(rostros_grandes)} rostros recortados y {len(rostros_pequenos)} frames completos con caja detectados.")
+
+    # Grabar clip compartido
+    clip_name = f"clip_{timestamp}.mp4"
+    out = cv2.VideoWriter(
+        clip_name,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        15,
+        (640, 360)
+    )
+
+    for _ in range(CLIP_FRAMES):
+        ret_clip, frame_clip = cap.read()
+        if ret_clip:
+            out.write(cv2.resize(frame_clip, (640, 360)))
+    out.release()
+
+    # Encolar rostros grandes (recortes)
+    for i, rostro in enumerate(rostros_grandes):
+        send_queue.put(("persona", 1.0, rostro, frame, clip_name, timestamp))
+        logging.info("Tarea encolada: persona (recorte).")
+
+    # Encolar rostros pequeños (frame completo con caja)
+    for i, fullframe_caja in enumerate(rostros_pequenos):
+        send_queue.put(("persona", 0.8, fullframe_caja, fullframe_caja, clip_name, timestamp))
+        logging.info("Tarea encolada: persona (frame completo con caja).")
+
+logging.info("Proceso finalizado.")

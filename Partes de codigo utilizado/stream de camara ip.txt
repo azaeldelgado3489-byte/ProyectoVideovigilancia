@@ -1,0 +1,30 @@
+rtsp://cisco123:admin123@192.168.1.143:554/stream1
+
+pa ejecutar el pinche script
+
+. .venv\Scripts\Activate.ps1
+
+python c:\Users\azael\Desktop\script_deteccion_rostro.py
+
+////////////////////////////////
+Ojo con la compatibilidad de las librerias
+
+pip uninstall -y numpy opencv-python opencv-python-headless opencv-contrib-python-headless
+pip install numpy==1.26.4
+pip install opencv-contrib-python==4.8.0.76
+
+pip uninstall -y dlib
+pip install C:\Users\azael\Desktop\dlib-19.22.99-cp310-cp310-win_amd64.whl
+pip show dlib
+
+//////////////////////////////////
+Hacer de nuevo el ejecutable 
+. .venv\Scripts\Activate.ps1
+
+cd C:\Users\azael\Desktop
+pyinstaller --onefile --icon=cctv.ico `
+  --add-data "C:\Users\azael\.venv\Lib\site-packages\face_recognition_models\models\shape_predictor_68_face_landmarks.dat;face_recognition_models\models" `
+  --add-data "C:\Users\azael\.venv\Lib\site-packages\face_recognition_models\models\shape_predictor_5_face_landmarks.dat;face_recognition_models\models" `
+  --add-data "C:\Users\azael\.venv\Lib\site-packages\face_recognition_models\models\dlib_face_recognition_resnet_model_v1.dat;face_recognition_models\models" `
+  --add-data "C:\Users\azael\.venv\Lib\site-packages\face_recognition_models\models\mmod_human_face_detector.dat;face_recognition_models\models" `
+  scriptsiuu.py

@@ -1,0 +1,7 @@
+ssh -i C:\Users\azael\Downloads\clavesiu.pem azael@4.155.31.66
+
+psql -h localhost -U cctv_user -d cctv_db
+
+
+from app.services.reportes import generar_reporte
+generar_reporte("2025-11-09", "proyectovps7@gmail.com")
